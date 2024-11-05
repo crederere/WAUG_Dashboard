@@ -87,8 +87,8 @@ if uploaded_file:
     try:
         with st.spinner('데이터를 불러오는 중...'):
             # 1. 데이터 불러오기
-            raw_df = pd.read_excel(uploaded_file, sheet_name='raw 시트')
-            index_df = pd.read_excel(uploaded_file, sheet_name='index 시트')
+            raw_df = pd.read_excel(uploaded_file, sheet_name='raw')
+            index_df = pd.read_excel(uploaded_file, sheet_name='index')
 
             # 데이터 미리보기
             with st.expander("데이터 미리보기"):
