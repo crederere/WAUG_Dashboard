@@ -242,7 +242,7 @@ if uploaded_file:
             col5.metric("전환수", f"{int(total_conversions):,}")
 
             # 차트 생성
-            st.subheader(f"📆 {date_option}별 차트")
+            st.subheader(f"📆 {date_option} 차트")
 
             # 총비용 및 전환매출액 차트
             fig1 = go.Figure()
