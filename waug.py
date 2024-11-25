@@ -3,10 +3,13 @@ import numpy as np
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timedelta
 import locale
 import warnings
+import calendar
+from xlsxwriter.utility import xl_col_to_name
 
 # 경고 메시지 숨기기
 warnings.filterwarnings('ignore')
@@ -54,14 +57,14 @@ st.markdown("""
 
 st.title("📊 마케팅 대시보드 및 자동 보고서 생성기")
 
-# 파일 업로드
-st.sidebar.header("📂 파일 업로드")
-uploaded_file = st.sidebar.file_uploader("Excel 파일을 업로드하세요 ('raw 시트'와 'index 시트' 포함)", type=['xlsx', 'xls'])
+def safe_division(x, y):
+    """안전한 나눗셈 함수"""
+    return np.where(y != 0, x / y, 0)
 
 def format_date_axis(fig, date_option):
     """날짜 축 포맷 설정 함수"""
     if date_option == '일별':
-        dtick = 'D7'  # 7일 간격
+        dtick = 'D7'
         tickformat = '%Y-%m-%d'
     elif date_option == '주간':
         dtick = 'D7'
@@ -69,19 +72,90 @@ def format_date_axis(fig, date_option):
     else:  # 월별
         dtick = 'M1'
         tickformat = '%Y-%m'
-    
+
     fig.update_xaxes(
         dtick=dtick,
         tickformat=tickformat,
         tickangle=45,
         tickmode='auto',
-        nticks=10  # 최대 표시할 틱 수
+        nticks=10
     )
     return fig
 
-def safe_division(x, y):
-    """안전한 나눗셈 함수"""
-    return np.where(y != 0, x / y, 0)
+def validate_data(df, required_columns):
+    """데이터 유효성 검증 함수"""
+    missing_cols = [col for col in required_columns if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"필수 컬럼이 누락되었습니다: {', '.join(missing_cols)}")
+    return True
+
+def calculate_metrics(df):
+    """모든 지표 계산 함수"""
+    metrics = df.copy()
+    
+    # 기본 지표 계산
+    metrics['CPC'] = safe_division(metrics['총비용(VAT포함,원)'], metrics['클릭수'])
+    metrics['CTR'] = safe_division(metrics['클릭수'], metrics['노출수']) * 100
+    metrics['CPA'] = safe_division(metrics['총비용(VAT포함,원)'], metrics['전환수'])
+    metrics['CVR'] = safe_division(metrics['전환수'], metrics['클릭수']) * 100
+    metrics['ROAS'] = safe_division(metrics['전환매출액(원)'], metrics['총비용(VAT포함,원)']) * 100
+    metrics['ARPPU'] = safe_division(metrics['전환매출액(원)'], metrics['전환수'])
+    
+    if '운영비중' not in metrics.columns:
+        metrics['운영비중'] = safe_division(metrics['총비용(VAT포함,원)'], metrics['총비용(VAT포함,원)'].sum()) * 100
+    
+    # 소수점 자리수 조정
+    metrics['평균노출순위'] = metrics['평균노출순위'].round(1)
+    
+    return metrics
+
+# 피벗 테이블용 스타일링 함수
+def style_pivot_table(df):
+    """피벗 테이블 스타일링 함수"""
+    formats = {}
+    
+    # 각 컬럼에 대해 포맷 지정
+    for col in df.columns:
+        if '총비용' in col or '전환매출액' in col or 'ARPPU' in col:
+            formats[col] = '₩{:,.0f}'
+        elif 'ROAS' in col:
+            formats[col] = '{:,.2f}%'
+        elif '평균노출순위' in col:
+            formats[col] = '{:.1f}'
+        elif '전환수' in col:
+            formats[col] = '{:,.0f}'
+    
+    return df.style.format(formats).set_properties(**{
+        'text-align': 'right',
+        'font-size': '12px',
+        'padding': '5px'
+    })
+
+def style_dataframe(df):
+    """데이터프레임 스타일링 함수"""
+    return df.style.format({
+        '총비용(VAT포함,원)': '₩{:,.0f}',
+        '노출수': '{:,.0f}',
+        '클릭수': '{:,.0f}',
+        '전환수': '{:,.0f}',
+        '전환매출액(원)': '₩{:,.0f}',
+        'CPC': '₩{:,.0f}',
+        'CTR': '{:,.2f}%',
+        'CPA': '₩{:,.0f}',
+        'CVR': '{:,.2f}%',
+        'ROAS': '{:,.2f}%',
+        'ARPPU': '₩{:,.0f}',
+        '평균노출순위': '{:.1f}',
+        '운영비중': '{:.2f}%'
+    }).set_properties(**{
+        'text-align': 'right',
+        'font-size': '12px',
+        'padding': '5px'
+    })
+
+# 파일 업로드
+st.sidebar.header("📂 파일 업로드")
+uploaded_file = st.sidebar.file_uploader("Excel 파일을 업로드하세요 ('raw 시트'와 'index 시트' 포함)", type=['xlsx', 'xls'])
 
 if uploaded_file:
     try:
@@ -98,47 +172,44 @@ if uploaded_file:
                 st.dataframe(index_df.head())
 
             # 2. 데이터 전처리
+            # raw 시트 필수 컬럼
+            required_columns_raw = [
+                '일별', '캠페인유형', '캠페인', '광고그룹', '키워드', 'PC/모바일 매체',
+                '노출수', '클릭수', '총비용(VAT포함,원)', '전환수', '평균노출순위', '전환매출액(원)',
+                '캠페인 카테고리', '캠페인 국가'
+            ]
+            
+            # 컬럼 존재 여부 확인
+            validate_data(raw_df, required_columns_raw)
+
             # 컬럼명 통일
             raw_df.columns = raw_df.columns.str.strip()
-            index_df.columns = index_df.columns.str.strip()
-
-            # 문자열 데이터 전처리
-            object_cols_raw = raw_df.select_dtypes(include='object').columns
-            object_cols_index = index_df.select_dtypes(include='object').columns
             
-            for col in object_cols_raw:
-                raw_df[col] = raw_df[col].astype(str).str.strip()
-            for col in object_cols_index:
-                index_df[col] = index_df[col].astype(str).str.strip()
-
             # 날짜 형식 변환
-            raw_df['일별'] = pd.to_datetime(raw_df['일별'], errors='coerce')
+            raw_df['일별'] = pd.to_datetime(raw_df['일별'])
             
-            # 숫자형 컬럼 변환 및 오류 처리
+            # 주차 및 월 정보 추가
+            raw_df['주차'] = raw_df['일별'].dt.isocalendar().week
+            raw_df['월'] = raw_df['일별'].dt.month
+            
+            # 주차별 날짜 범위 추가
+            week_dates = raw_df.groupby('주차')['일별'].agg(['min', 'max']).reset_index()
+            week_dates['주차_기간'] = week_dates.apply(lambda row: f"{int(row['주차'])}주차 ({row['min'].strftime('%Y.%m.%d')}~{row['max'].strftime('%Y.%m.%d')})", axis=1)
+            raw_df = pd.merge(raw_df, week_dates[['주차', '주차_기간']], on='주차', how='left')
+
+            # 카테고리 및 지역 정보 매핑
+            raw_df['캠페인카테고리'] = raw_df['캠페인 카테고리']
+            raw_df['지역'] = raw_df['캠페인 국가']
+            raw_df['상품유형'] = raw_df['캠페인 카테고리']
+
+            # 숫자형 컬럼 변환
             numeric_columns = ['노출수', '클릭수', '총비용(VAT포함,원)', '전환수', '전환매출액(원)', '평균노출순위']
             for col in numeric_columns:
-                if col in raw_df.columns:
-                    raw_df[col] = pd.to_numeric(raw_df[col].astype(str).str.replace(',', '').replace('[-+]', ''), errors='coerce')
-                else:
-                    st.error(f"'{col}' 컬럼이 'raw 시트'에 존재하지 않습니다.")
-                    st.stop()
+                raw_df[col] = pd.to_numeric(raw_df[col].astype(str).str.replace(',', '').replace('[-+]', ''), errors='coerce')
 
-            # 캠페인 및 광고그룹 매칭
-            campaign_index = index_df[['캠페인', '카테고리', '국가']].drop_duplicates()
-            campaign_index.columns = ['캠페인', '캠페인카테고리', '캠페인국가']
-            raw_df = pd.merge(raw_df, campaign_index, on='캠페인', how='left')
-
-            # 필요한 지표 계산
-            raw_df['CPC'] = safe_division(raw_df['총비용(VAT포함,원)'], raw_df['클릭수'])
-            raw_df['CTR%'] = safe_division(raw_df['클릭수'], raw_df['노출수']) * 100
-            raw_df['CPA'] = safe_division(raw_df['총비용(VAT포함,원)'], raw_df['전환수'])
-            raw_df['CVR%'] = safe_division(raw_df['전환수'], raw_df['클릭수']) * 100
-            raw_df['ROAS%'] = safe_division(raw_df['전환매출액(원)'], raw_df['총비용(VAT포함,원)']) * 100
-            raw_df['ARPPU'] = safe_division(raw_df['전환매출액(원)'], raw_df['전환수'])
-
-            # 3. 기간별 데이터 집계
-            raw_df['주간'] = raw_df['일별'].dt.to_period('W').apply(lambda r: r.start_time)
-            raw_df['월별'] = raw_df['일별'].dt.to_period('M').apply(lambda r: r.start_time)
+            # 프로모션 기간 설정 (예시: 10월 17일 이후)
+            promo_start_date = pd.Timestamp('2023-10-17')
+            raw_df['프로모션여부'] = raw_df['일별'].ge(promo_start_date).map({True: 'Y', False: 'N'})
 
             # 필터 옵션
             st.header("🔍 필터 옵션")
@@ -164,21 +235,42 @@ if uploaded_file:
                 default=['전체']
             )
 
+            # 지역 필터
+            unique_regions = sorted(raw_df['지역'].dropna().astype(str).unique())
+            region_options = st.sidebar.multiselect(
+                '지역 선택',
+                options=['전체'] + unique_regions,
+                default=['전체']
+            )
+
+            # 캠페인유형 필터
+            unique_campaign_types = sorted(raw_df['캠페인유형'].dropna().astype(str).unique())
+            campaign_type_options = st.sidebar.multiselect(
+                '캠페인유형 선택',
+                options=['전체'] + unique_campaign_types,
+                default=['전체']
+            )
+
             # 전체 선택 처리
-            if '전체' in category_options:
+            if '전체' in category_options or len(category_options) == 0:
                 category_options = unique_categories
+            if '전체' in region_options or len(region_options) == 0:
+                region_options = unique_regions
+            if '전체' in campaign_type_options or len(campaign_type_options) == 0:
+                campaign_type_options = unique_campaign_types
 
             # 캠페인 필터
-            unique_campaigns = sorted(raw_df[raw_df['캠페인카테고리'].isin(category_options)]['캠페인'].unique())
+            unique_campaigns = sorted(raw_df[
+                (raw_df['캠페인카테고리'].isin(category_options)) &
+                (raw_df['지역'].isin(region_options)) &
+                (raw_df['캠페인유형'].isin(campaign_type_options))
+            ]['캠페인'].unique())
+            
             campaign_options = st.sidebar.multiselect(
                 '캠페인 선택',
                 options=['전체'] + list(unique_campaigns),
                 default=['전체']
             )
-
-            # 전체 선택 처리
-            if '전체' in campaign_options:
-                campaign_options = unique_campaigns
 
             # 매체 필터
             media_options = st.sidebar.multiselect(
@@ -188,7 +280,9 @@ if uploaded_file:
             )
 
             # 전체 선택 처리
-            if '전체' in media_options:
+            if '전체' in campaign_options or len(campaign_options) == 0:
+                campaign_options = unique_campaigns
+            if '전체' in media_options or len(media_options) == 0:
                 media_options = raw_df['PC/모바일 매체'].dropna().astype(str).unique()
 
             # 데이터 필터링
@@ -196,271 +290,498 @@ if uploaded_file:
                    (raw_df['일별'] <= pd.to_datetime(end_date)) & \
                    (raw_df['캠페인카테고리'].isin(category_options)) & \
                    (raw_df['캠페인'].isin(campaign_options)) & \
-                   (raw_df['PC/모바일 매체'].isin(media_options))
+                   (raw_df['PC/모바일 매체'].isin(media_options)) & \
+                   (raw_df['지역'].isin(region_options)) & \
+                   (raw_df['캠페인유형'].isin(campaign_type_options))
 
-            filtered_df = raw_df.loc[mask]
+            filtered_df = raw_df.loc[mask].copy()
 
             if filtered_df.empty:
                 st.warning("선택한 필터 조건에 해당하는 데이터가 없습니다. 필터 조건을 조정해주세요.")
                 st.stop()
 
-            # 그룹화
-            group_df = filtered_df.groupby(date_option).agg({
+            # 지표 계산
+            filtered_df = calculate_metrics(filtered_df)
+
+            # 데이터 집계
+            agg_dict = {
                 '총비용(VAT포함,원)': 'sum',
                 '노출수': 'sum',
                 '클릭수': 'sum',
                 '전환수': 'sum',
                 '전환매출액(원)': 'sum',
-                '캠페인': 'nunique',
+                '평균노출순위': 'mean',
                 '키워드': 'nunique'
-            }).reset_index()
+            }
 
-            # 지표 계산
-            group_df['CPC'] = safe_division(group_df['총비용(VAT포함,원)'], group_df['클릭수'])
-            group_df['CTR%'] = safe_division(group_df['클릭수'], group_df['노출수']) * 100
-            group_df['CPA'] = safe_division(group_df['총비용(VAT포함,원)'], group_df['전환수'])
-            group_df['CVR%'] = safe_division(group_df['전환수'], group_df['클릭수']) * 100
-            group_df['ROAS%'] = safe_division(group_df['전환매출액(원)'], group_df['총비용(VAT포함,원)']) * 100
-            group_df['ARPPU'] = safe_division(group_df['전환매출액(원)'], group_df['전환수'])
+            # 기간별 집계
+            if date_option == '일별':
+                group_df = filtered_df.groupby('일별').agg(agg_dict).reset_index()
+                group_df.rename(columns={'일별': '기간'}, inplace=True)
+            elif date_option == '주간':
+                group_df = filtered_df.groupby('주차_기간').agg(agg_dict).reset_index()
+                group_df.rename(columns={'주차_기간': '기간'}, inplace=True)
+            else:  # 월별
+                group_df = filtered_df.groupby('월').agg(agg_dict).reset_index()
+                group_df.rename(columns={'월': '기간'}, inplace=True)
+
+            group_df = calculate_metrics(group_df)
+
+            # 중복 데이터 제거
+            group_df = group_df.drop_duplicates()
 
             # 4. 시각화
             st.header("📈 기간별 성과 지표")
 
             # 주요 지표 카드
-            total_cost = group_df['총비용(VAT포함,원)'].sum()
-            total_revenue = group_df['전환매출액(원)'].sum()
-            total_clicks = group_df['클릭수'].sum()
-            total_impressions = group_df['노출수'].sum()
-            total_conversions = group_df['전환수'].sum()
+            total_cost = filtered_df['총비용(VAT포함,원)'].sum()
+            total_revenue = filtered_df['전환매출액(원)'].sum()
             total_roas = safe_division(total_revenue, total_cost) * 100
-
+            total_clicks = filtered_df['클릭수'].sum()
+            total_impressions = filtered_df['노출수'].sum()
+            total_conversions = filtered_df['전환수'].sum()
+            avg_arppu = safe_division(total_revenue, total_conversions)
+            avg_rank = filtered_df['평균노출순위'].mean()
+            # 지표 카드 표시
             col1, col2, col3, col4, col5 = st.columns(5)
+
             col1.metric("총비용", f"₩{int(total_cost):,}")
-            col2.metric("전환매출액", f"₩{int(total_revenue):,}")
-            col3.metric("ROAS", f"{total_roas:.2f}%")
-            col4.metric("클릭수", f"{int(total_clicks):,}")
-            col5.metric("전환수", f"{int(total_conversions):,}")
+            col2.metric("ROAS", f"{total_roas:.2f}%")
+            col3.metric("ARPPU", f"₩{int(avg_arppu):,}")
+            col4.metric("전환수", f"{int(total_conversions):,}")
+            col5.metric("평균노출순위", f"{avg_rank:.1f}")
 
             # 차트 생성
-            st.subheader(f"📆 {date_option} 차트")
+            st.subheader(f"📊 {date_option} 차트")
 
-            # 총비용 및 전환매출액 차트
-            fig1 = go.Figure()
-            fig1.add_trace(go.Scatter(
-                x=group_df[date_option],
-                y=group_df['총비용(VAT포함,원)'],
-                name='총비용',
-                line=dict(color='#1f77b4'),
-                hovertemplate='%{x}<br>총비용: ₩%{y:,.0f}<extra></extra>'
-            ))
-            fig1.add_trace(go.Scatter(
-                x=group_df[date_option],
-                y=group_df['전환매출액(원)'],
-                name='전환매출액',
-                line=dict(color='#2ca02c'),
-                hovertemplate='%{x}<br>전환매출액: ₩%{y:,.0f}<extra></extra>'
-            ))
-            
-            fig1.update_layout(
-                title=f'{date_option}별 총비용 및 전환매출액',
-                xaxis_title=date_option,
-                yaxis_title='금액 (원)',
-                hovermode='x unified',
-                showlegend=True
-            )
-            fig1 = format_date_axis(fig1, date_option)
-            st.plotly_chart(fig1, use_container_width=True)
+            # 탭 생성
+            tab1, tab2, tab3, tab4 = st.tabs(["비용/매출", "ROAS/ARPPU", "노출순위", "프로모션 분석"])
 
-            # ROAS% 차트
-            fig2 = go.Figure()
-            fig2.add_trace(go.Bar(
-                x=group_df[date_option],
-                y=group_df['ROAS%'],
-                name='ROAS%',
-                text=group_df['ROAS%'].round(2).astype(str) + '%',
-                textposition='outside',
-                hovertemplate='%{x}<br>ROAS: %{y:.2f}%<extra></extra>'
-            ))
-            
-            fig2.update_layout(
-                title=f'{date_option}별 ROAS%',
-                xaxis_title=date_option,
-                yaxis_title='ROAS (%)',
-                hovermode='x unified',
-                showlegend=False
-            )
-            fig2 = format_date_axis(fig2, date_option)
-            st.plotly_chart(fig2, use_container_width=True)
+            # 비용/매출 차트
+            with tab1:
+                fig1 = go.Figure()
 
-            # 일별 데이터 표 생성
+                df_to_plot = group_df
+                x_col = '기간'
+
+                fig1.add_trace(go.Scatter(
+                    x=df_to_plot[x_col],
+                    y=df_to_plot['총비용(VAT포함,원)'],
+                    name='총비용',
+                    line=dict(color='#1f77b4'),
+                    hovertemplate='%{x}<br>총비용: ₩%{y:,.0f}<extra></extra>'
+                ))
+
+                fig1.add_trace(go.Scatter(
+                    x=df_to_plot[x_col],
+                    y=df_to_plot['전환매출액(원)'],
+                    name='전환매출액',
+                    line=dict(color='#2ca02c'),
+                    hovertemplate='%{x}<br>전환매출액: ₩%{y:,.0f}<extra></extra>'
+                ))
+
+                fig1.update_layout(
+                    title=f'{date_option}별 비용/매출 추이',
+                    xaxis_title=date_option,
+                    yaxis_title='금액 (원)',
+                    hovermode='x unified',
+                    showlegend=True,
+                    height=600
+                )
+
+                if date_option == '일별':
+                    fig1 = format_date_axis(fig1, date_option)
+                else:
+                    fig1.update_xaxes(tickangle=45)
+
+                st.plotly_chart(fig1, use_container_width=True)
+
+            # ROAS/ARPPU 차트
+            with tab2:
+                fig2 = go.Figure()
+
+                fig2.add_trace(go.Bar(
+                    x=df_to_plot[x_col],
+                    y=df_to_plot['ROAS'],
+                    name='ROAS',
+                    marker_color='#1f77b4',
+                    yaxis='y',
+                    text=df_to_plot['ROAS'].round(2).astype(str) + '%',
+                    textposition='outside',
+                    hovertemplate='%{x}<br>ROAS: %{y:.2f}%<extra></extra>'
+                ))
+
+                fig2.add_trace(go.Scatter(
+                    x=df_to_plot[x_col],
+                    y=df_to_plot['ARPPU'],
+                    name='ARPPU',
+                    line=dict(color='#2ca02c'),
+                    yaxis='y2',
+                    hovertemplate='%{x}<br>ARPPU: ₩%{y:,.0f}<extra></extra>'
+                ))
+
+                fig2.update_layout(
+                    title=f'{date_option}별 ROAS/ARPPU 추이',
+                    xaxis_title=date_option,
+                    yaxis=dict(title='ROAS (%)', titlefont=dict(color='#1f77b4')),
+                    yaxis2=dict(
+                        title='ARPPU (원)',
+                        titlefont=dict(color='#2ca02c'),
+                        overlaying='y',
+                        side='right'
+                    ),
+                    hovermode='x unified',
+                    showlegend=True,
+                    height=600
+                )
+
+                if date_option == '일별':
+                    fig2 = format_date_axis(fig2, date_option)
+                else:
+                    fig2.update_xaxes(tickangle=45)
+
+                st.plotly_chart(fig2, use_container_width=True)
+
+            # 노출순위 차트
+            with tab3:
+                fig3 = go.Figure()
+
+                fig3.add_trace(go.Scatter(
+                    x=df_to_plot[x_col],
+                    y=df_to_plot['평균노출순위'],
+                    name='평균노출순위',
+                    line=dict(color='#ff7f0e'),
+                    hovertemplate='%{x}<br>평균노출순위: %{y:.1f}<extra></extra>'
+                ))
+
+                fig3.update_layout(
+                    title=f'{date_option}별 평균 노출순위 추이',
+                    xaxis_title=date_option,
+                    yaxis_title='평균 노출순위',
+                    hovermode='x unified',
+                    showlegend=True,
+                    yaxis=dict(autorange="reversed"),  # 노출순위는 낮을수록 좋으므로 역순으로 표시
+                    height=600
+                )
+
+                if date_option == '일별':
+                    fig3 = format_date_axis(fig3, date_option)
+                else:
+                    fig3.update_xaxes(tickangle=45)
+
+                st.plotly_chart(fig3, use_container_width=True)
+
+            # 프로모션 분석
+            with tab4:
+                promo_metrics = filtered_df.groupby('프로모션여부').agg(agg_dict).reset_index()
+                promo_metrics = calculate_metrics(promo_metrics)
+
+                fig4 = None  # fig4 초기화
+
+                if len(promo_metrics) >= 2:  # 프로모션 전/후 데이터가 모두 있는 경우
+                    # 프로모션 성과 비교 차트
+                    fig4 = go.Figure()
+
+                    promo_before = promo_metrics[promo_metrics['프로모션여부'] == 'N']
+                    promo_after = promo_metrics[promo_metrics['프로모션여부'] == 'Y']
+
+                    fig4.add_trace(go.Bar(
+                        x=['프로모션 전', '프로모션 후'],
+                        y=[promo_before['ROAS'].iloc[0], promo_after['ROAS'].iloc[0]],
+                        name='ROAS',
+                        marker_color='#1f77b4',
+                        text=[f"{x:.2f}%" for x in [promo_before['ROAS'].iloc[0], promo_after['ROAS'].iloc[0]]],
+                        textposition='outside'
+                    ))
+
+                    fig4.update_layout(
+                        title='프로모션 전후 ROAS 비교',
+                        yaxis_title='ROAS (%)',
+                        showlegend=False,
+                        height=600
+                    )
+
+                    st.plotly_chart(fig4, use_container_width=True)
+
+                    # 프로모션 성과 상세 비교표
+                    st.subheader("📊 프로모션 성과 상세 비교")
+                    promo_comparison = pd.DataFrame({
+                        '구분': ['프로모션 전', '프로모션 후'],
+                        '총비용(VAT포함,원)': [promo_before['총비용(VAT포함,원)'].iloc[0], promo_after['총비용(VAT포함,원)'].iloc[0]],
+                        'ROAS': [promo_before['ROAS'].iloc[0], promo_after['ROAS'].iloc[0]],
+                        'ARPPU': [promo_before['ARPPU'].iloc[0], promo_after['ARPPU'].iloc[0]],
+                        '전환수': [promo_before['전환수'].iloc[0], promo_after['전환수'].iloc[0]],
+                        'CVR': [promo_before['CVR'].iloc[0], promo_after['CVR'].iloc[0]],
+                        '평균노출순위': [promo_before['평균노출순위'].iloc[0], promo_after['평균노출순위'].iloc[0]]
+                    })
+                    
+                    st.dataframe(style_dataframe(promo_comparison))
+                else:
+                    st.warning("프로모션 전/후 비교를 위한 충분한 데이터가 없습니다.")
+
+            # 기간별 데이터 표 생성
             st.subheader(f"📅 {date_option}별 데이터 표")
-            
-            # 데이터프레임 스타일링을 위한 함수
-            def style_dataframe(df):
-                return df.style.format({
-                    '총비용(VAT포함,원)': '₩{:,.0f}',
-                    '노출수': '{:,.0f}',
-                    '클릭수': '{:,.0f}',
-                    '전환수': '{:,.0f}',
-                    '전환매출액(원)': '₩{:,.0f}',
-                    'CPC': '₩{:,.0f}',
-                    'CTR%': '{:,.2f}%',
-                    'CPA': '₩{:,.0f}',
-                    'CVR%': '{:,.2f}%',
-                    'ROAS%': '{:,.2f}%',
-                    'ARPPU': '₩{:,.0f}',
-                    'avg.Imps': '{:,.1f}',
-                    '운영비중': '{:,.2f}%'
-                }).set_properties(**{
-                    'text-align': 'right',
-                    'font-size': '12px',
-                    'padding': '5px'
-                })
-
             styled_group_df = style_dataframe(group_df)
             st.dataframe(styled_group_df, height=400)
 
-            # 5. 추가 분석
-            st.header("🔎 추가 분석")
+            # 5. 세부 분석
+            st.header("🔍 세부 분석")
 
+            # **일별 분석 추가**
+            st.subheader("📅 일별 분석")
+
+            # 일별 데이터 준비 및 지표 계산
+            daily_by_product = filtered_df.groupby(['일별', '상품유형']).agg({
+                '총비용(VAT포함,원)': 'sum',
+                '노출수': 'sum',
+                '클릭수': 'sum',
+                '전환수': 'sum',
+                '전환매출액(원)': 'sum',
+                '평균노출순위': 'mean'
+            }).reset_index()
+
+            daily_by_product = calculate_metrics(daily_by_product)
+
+            # 여기서 캠페인을 컬럼으로 pivot하지 않고, 행으로 유지하도록 수정
+            # 대신 필요한 컬럼 순서로 정렬하고, 보기 좋게 정렬
+
+            # 컬럼 순서 재정렬
+            daily_by_product = daily_by_product[['일별', '상품유형', '총비용(VAT포함,원)', '전환매출액(원)', 'ROAS', 'ARPPU', '전환수', '평균노출순위']]
+
+            # 날짜와 상품유형별로 정렬
+            daily_by_product.sort_values(['일별', '상품유형'], inplace=True)
+
+            st.dataframe(style_dataframe(daily_by_product))
+
+            # 상품유형별 일별 트렌드 차트 추가
+            st.subheader("📈 상품유형별 일별 ROAS 트렌드")
+            fig_daily = go.Figure()
+
+            for product_type in daily_by_product['상품유형'].unique():
+                product_data = daily_by_product[daily_by_product['상품유형'] == product_type]
+                fig_daily.add_trace(go.Scatter(
+                    x=product_data['일별'],
+                    y=product_data['ROAS'],
+                    name=product_type,
+                    mode='lines+markers',
+                    hovertemplate='%{x}<br>ROAS: %{y:.2f}%<extra></extra>'
+                ))
+
+            fig_daily.update_layout(
+                title='상품유형별 일별 ROAS 트렌드',
+                xaxis_title='일별',
+                yaxis_title='ROAS (%)',
+                hovermode='x unified',
+                height=600
+            )
+            fig_daily.update_xaxes(tickangle=45)
+
+            st.plotly_chart(fig_daily, use_container_width=True)
+
+            # **주간 분석**
+            st.subheader("📅 상품유형별 주간 분석")
+            
+            # 주간 데이터 준비 및 지표 계산
+            weekly_by_product = filtered_df.groupby(['주차', '주차_기간', '상품유형']).agg({
+                '총비용(VAT포함,원)': 'sum',
+                '노출수': 'sum',
+                '클릭수': 'sum',
+                '전환수': 'sum',
+                '전환매출액(원)': 'sum',
+                '평균노출순위': 'mean'
+            }).reset_index()
+
+            weekly_by_product = calculate_metrics(weekly_by_product)
+
+            # 컬럼 순서 재정렬
+            weekly_by_product = weekly_by_product[['주차', '주차_기간', '상품유형', '총비용(VAT포함,원)', '전환매출액(원)', 'ROAS', 'ARPPU', '전환수', '평균노출순위']]
+
+            # 주차와 상품유형별로 정렬
+            weekly_by_product.sort_values(['주차', '상품유형'], inplace=True)
+
+            st.dataframe(style_dataframe(weekly_by_product))
+
+            # 주간 트렌드 차트 추가
+            st.subheader("📈 상품유형별 주간 ROAS 트렌드")
+            fig_weekly = go.Figure()
+
+            for product_type in weekly_by_product['상품유형'].unique():
+                product_data = weekly_by_product[weekly_by_product['상품유형'] == product_type]
+                fig_weekly.add_trace(go.Scatter(
+                    x=product_data['주차_기간'],
+                    y=product_data['ROAS'],
+                    name=product_type,
+                    mode='lines+markers',
+                    hovertemplate='%{x}<br>ROAS: %{y:.2f}%<extra></extra>'
+                ))
+
+            fig_weekly.update_layout(
+                title='상품유형별 주간 ROAS 트렌드',
+                xaxis_title='주차',
+                yaxis_title='ROAS (%)',
+                hovermode='x unified',
+                height=600
+            )
+            fig_weekly.update_xaxes(tickangle=45)
+
+            st.plotly_chart(fig_weekly, use_container_width=True)
+            
             # 캠페인유형별 분석
-            if '캠페인유형' in filtered_df.columns:
-                st.subheader("📊 캠페인유형별 분석")
-                campaign_type_df = filtered_df.groupby('캠페인유형').agg({
-                    '총비용(VAT포함,원)': 'sum',
-                    '노출수': 'sum',
-                    '클릭수': 'sum',
-                    '전환수': 'sum',
-                    '전환매출액(원)': 'sum'
-                }).reset_index()
+            st.subheader("🎯 캠페인유형별 분석")
+            
+            campaign_type_metrics = filtered_df.groupby('캠페인유형').agg(agg_dict).reset_index()
+            campaign_type_metrics = calculate_metrics(campaign_type_metrics)
+            campaign_type_metrics = campaign_type_metrics.drop_duplicates()
+            
+            # 캠페인유형별 차트
+            fig_type = make_subplots(specs=[[{"secondary_y": True}]])
+            
+            fig_type.add_trace(go.Bar(
+                x=campaign_type_metrics['캠페인유형'],
+                y=campaign_type_metrics['총비용(VAT포함,원)'],
+                name='총비용',
+                marker_color='#1f77b4',
+                text=campaign_type_metrics['총비용(VAT포함,원)'].apply(lambda x: f'₩{x:,.0f}'),
+                textposition='outside'
+            ), secondary_y=False)
 
-                # 지표 계산
-                campaign_type_df['CPC'] = safe_division(campaign_type_df['총비용(VAT포함,원)'], campaign_type_df['클릭수'])
-                campaign_type_df['CTR%'] = safe_division(campaign_type_df['클릭수'], campaign_type_df['노출수']) * 100
-                campaign_type_df['CPA'] = safe_division(campaign_type_df['총비용(VAT포함,원)'], campaign_type_df['전환수'])
-                campaign_type_df['CVR%'] = safe_division(campaign_type_df['전환수'], campaign_type_df['클릭수']) * 100
-                campaign_type_df['ROAS%'] = safe_division(campaign_type_df['전환매출액(원)'], campaign_type_df['총비용(VAT포함,원)']) * 100
-                campaign_type_df['운영비중'] = safe_division(campaign_type_df['총비용(VAT포함,원)'], campaign_type_df['총비용(VAT포함,원)'].sum()) * 100
+            fig_type.add_trace(go.Scatter(
+                x=campaign_type_metrics['캠페인유형'],
+                y=campaign_type_metrics['ROAS'],
+                name='ROAS',
+                yaxis='y2',
+                line=dict(color='#2ca02c'),
+                text=campaign_type_metrics['ROAS'].round(2).astype(str) + '%',
+                mode='lines+markers+text',
+                textposition='bottom center'
+            ), secondary_y=True)
 
-                st.dataframe(style_dataframe(campaign_type_df))
+            fig_type.update_layout(
+                title='캠페인유형별 비용 및 ROAS',
+                yaxis_title='총비용 (원)',
+                yaxis2=dict(
+                    title='ROAS (%)',
+                    overlaying='y',
+                    side='right'
+                ),
+                showlegend=True,
+                height=600
+            )
 
-                # 캠페인유형별 파이 차트
-                fig_pie = go.Figure(data=[go.Pie(
-                    labels=campaign_type_df['캠페인유형'],
-                    values=campaign_type_df['총비용(VAT포함,원)'],
-                    hovertemplate="캠페인유형: %{label}<br>총비용: ₩%{value:,.0f}<br>비중: %{percent}<extra></extra>"
-                )])
-                fig_pie.update_layout(title="캠페인유형별 비용 비중")
-                st.plotly_chart(fig_pie, use_container_width=True)
+            st.plotly_chart(fig_type, use_container_width=True)
+            
+            # 캠페인유형별 성과표
+            st.dataframe(style_dataframe(campaign_type_metrics))
+
+            # 지역별 분석
+            st.subheader("🌏 지역별 분석")
+            
+            region_metrics = filtered_df.groupby('지역').agg(agg_dict).reset_index()
+            region_metrics = calculate_metrics(region_metrics)
+            region_metrics = region_metrics.sort_values('총비용(VAT포함,원)', ascending=False)
+            region_metrics = region_metrics.drop_duplicates()
+            
+            # 상위 10개 지역만 표시
+            top_regions = region_metrics['지역'].head(10).tolist()
+            region_metrics_top = region_metrics[region_metrics['지역'].isin(top_regions)]
+            
+            # 지역별 ROAS 차트
+            fig_region = px.bar(
+                region_metrics_top,
+                x='지역',
+                y='ROAS',
+                title='지역별 ROAS',
+                text=region_metrics_top['ROAS'].round(2).astype(str) + '%'
+            )
+            fig_region.update_traces(textposition='outside')
+            fig_region.update_layout(
+                height=600,
+                xaxis_title='지역',
+                yaxis_title='ROAS (%)',
+                xaxis_tickangle=45
+            )
+            
+            st.plotly_chart(fig_region, use_container_width=True)
+            
+            # 지역별 성과표
+            st.dataframe(style_dataframe(region_metrics))
+
+            # 매체별 분석
+            st.subheader("📱 매체별 분석")
+            
+            media_metrics = filtered_df.groupby('PC/모바일 매체').agg(agg_dict).reset_index()
+            media_metrics = calculate_metrics(media_metrics)
+            media_metrics = media_metrics.drop_duplicates()
+            
+            # 매체별 성과 차트
+            fig_media = make_subplots(specs=[[{"secondary_y": True}]])
+            
+            fig_media.add_trace(go.Bar(
+                x=media_metrics['PC/모바일 매체'],
+                y=media_metrics['총비용(VAT포함,원)'],
+                name='총비용',
+                marker_color='#1f77b4',
+                text=media_metrics['총비용(VAT포함,원)'].apply(lambda x: f'₩{x:,.0f}'),
+                textposition='outside'
+            ), secondary_y=False)
+
+            fig_media.add_trace(go.Scatter(
+                x=media_metrics['PC/모바일 매체'],
+                y=media_metrics['ROAS'],
+                name='ROAS',
+                line=dict(color='#2ca02c'),
+                yaxis='y2',
+                text=media_metrics['ROAS'].round(2).astype(str) + '%',
+                mode='lines+markers+text',
+                textposition='bottom center'
+            ), secondary_y=True)
+
+            fig_media.update_layout(
+                title='매체별 비용 및 ROAS',
+                yaxis_title='총비용 (원)',
+                yaxis2=dict(
+                    title='ROAS (%)',
+                    overlaying='y',
+                    side='right'
+                ),
+                showlegend=True,
+                height=600
+            )
+
+            st.plotly_chart(fig_media, use_container_width=True)
+            
+            # 매체별 성과표
+            st.dataframe(style_dataframe(media_metrics))
 
             # 캠페인별 분석
-            st.subheader("📊 캠페인별 분석")
-            campaign_df = filtered_df.groupby('캠페인').agg({
-                '총비용(VAT포함,원)': 'sum',
-                '전환매출액(원)': 'sum',
-                '노출수': 'sum',
-                '클릭수': 'sum',
-                '전환수': 'sum'
-            }).reset_index()
-
-            campaign_df['ROAS%'] = safe_division(campaign_df['전환매출액(원)'], campaign_df['총비용(VAT포함,원)']) * 100
-            campaign_df['운영비중'] = safe_division(campaign_df['총비용(VAT포함,원)'], campaign_df['총비용(VAT포함,원)'].sum()) * 100
-            campaign_df['CTR%'] = safe_division(campaign_df['클릭수'], campaign_df['노출수']) * 100
-            campaign_df['CVR%'] = safe_division(campaign_df['전환수'], campaign_df['클릭수']) * 100
-
+            st.subheader("🎯 캠페인별 분석")
+            
+            campaign_metrics = filtered_df.groupby(['캠페인', '캠페인카테고리', '상품유형']).agg(agg_dict).reset_index()
+            campaign_metrics = calculate_metrics(campaign_metrics)
+            campaign_metrics = campaign_metrics.sort_values('총비용(VAT포함,원)', ascending=False)
+            campaign_metrics = campaign_metrics.drop_duplicates()
+            
             # 정렬 옵션
-            sort_options = ['총비용(VAT포함,원)', 'ROAS%', '전환매출액(원)', '운영비중']
-            selected_sort = st.selectbox('정렬 기준 선택:', sort_options)
-            campaign_df = campaign_df.sort_values(by=selected_sort, ascending=False)
-
-            st.dataframe(style_dataframe(campaign_df))
-
-            # Top 10 캠페인 차트
-            fig_top10 = go.Figure()
-            top10_campaigns = campaign_df.nlargest(10, '총비용(VAT포함,원)')
+            metric_options = ['총비용(VAT포함,원)', 'ROAS', '전환매출액(원)', 'ARPPU', '평균노출순위']
+            selected_metric = st.selectbox('정렬 기준:', metric_options)
             
-            fig_top10.add_trace(go.Bar(
-                x=top10_campaigns['캠페인'],
-                y=top10_campaigns['총비용(VAT포함,원)'],
-                name='총비용',
-                text=top10_campaigns['총비용(VAT포함,원)'].apply(lambda x: f'₩{x:,.0f}'),
-                textposition='auto',
-            ))
-            
-            fig_top10.update_layout(
-                title='Top 10 캠페인 (비용 기준)',
-                xaxis_title='캠페인',
-                yaxis_title='총비용 (원)',
-                xaxis_tickangle=45,
-                height=500
-            )
-            st.plotly_chart(fig_top10, use_container_width=True)
+            # 캠페인 성과표
+            campaign_metrics_sorted = campaign_metrics.sort_values(selected_metric, ascending=False)
+            st.dataframe(style_dataframe(campaign_metrics_sorted))
 
-            # 카테고리별 분석
-            st.subheader("📊 카테고리별 분석")
-            category_df = filtered_df.groupby('캠페인카테고리').agg({
-                '총비용(VAT포함,원)': 'sum',
-                '전환매출액(원)': 'sum',
-                '노출수': 'sum',
-                '클릭수': 'sum',
-                '전환수': 'sum'
-            }).reset_index()
+            # 보고서 다운로드 부분
+            st.header("📥 마케팅 성과 종합 보고서")
 
-            category_df['ROAS%'] = safe_division(category_df['전환매출액(원)'], category_df['총비용(VAT포함,원)']) * 100
-            category_df['운영비중'] = safe_division(category_df['총비용(VAT포함,원)'], category_df['총비용(VAT포함,원)'].sum()) * 100
-            category_df['CTR%'] = safe_division(category_df['클릭수'], category_df['노출수']) * 100
-            category_df['CVR%'] = safe_division(category_df['전환수'], category_df['클릭수']) * 100
-
-            st.dataframe(style_dataframe(category_df))
-
-            # 카테고리별 파이 차트
-            fig_category = go.Figure(data=[go.Pie(
-                labels=category_df['캠페인카테고리'],
-                values=category_df['총비용(VAT포함,원)'],
-                hovertemplate="카테고리: %{label}<br>총비용: ₩%{value:,.0f}<br>비중: %{percent}<extra></extra>"
-            )])
-            fig_category.update_layout(title="카테고리별 비용 비중")
-            st.plotly_chart(fig_category, use_container_width=True)
-
-            # 6. 보고서 다운로드
-            # 6. 보고서 다운로드
-            st.header("📄 마케팅 성과 종합 보고서 다운로드")
-            
             report_cols = st.columns([2, 1])
             with report_cols[0]:
-                report_name = st.text_input("보고서 파일명", value="마케팅_종합보고서")
+                report_name = st.text_input("보고서 파일명", value="마케팅_성과_보고서")
             with report_cols[1]:
-                include_charts = st.checkbox("차트 포함", value=True, help="Excel 보고서에 차트를 포함합니다.")
-            
-            if st.button("📥 종합 보고서 다운로드"):
+                include_charts = st.checkbox("차트 포함", value=True)
+
+            buffer = BytesIO()
+            if st.button("📥 보고서 다운로드"):
                 try:
                     with st.spinner('상세 보고서를 생성하는 중...'):
-                        buffer = BytesIO()
-                        
-                        # 날짜 문자열 변환 함수
-                        def format_date_str(date_val, date_option):
-                            if pd.isna(date_val):
-                                return ''
-                            if date_option == '일별':
-                                return date_val.strftime('%Y-%m-%d')
-                            elif date_option == '주간':
-                                return date_val.strftime('%Y-%m-%d')
-                            else:  # 월별
-                                return date_val.strftime('%Y-%m')
-
-                        # DataFrame 준비 및 날짜 처리
-                        group_df_excel = group_df.copy().replace([np.inf, -np.inf], 0).fillna(0)
-                        if date_option in group_df_excel.columns:
-                            group_df_excel[date_option] = group_df_excel[date_option].apply(
-                                lambda x: format_date_str(x, date_option)
-                            )
-                        
-
-                        campaign_df_excel = campaign_df.copy().replace([np.inf, -np.inf], 0).fillna(0)
-                        category_df_excel = category_df.copy().replace([np.inf, -np.inf], 0).fillna(0)
-                        filtered_df_excel = filtered_df.copy().replace([np.inf, -np.inf], 0).fillna(0)
-                        
-                        # Excel Writer 생성
                         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
                             workbook = writer.book
                             
@@ -494,33 +815,45 @@ if uploaded_file:
                                 'text_wrap': True
                             })
                             
-                            number_format = workbook.add_format({
-                                'num_format': '#,##0',
-                                'align': 'right',
-                                'border': 1
-                            })
+                            base_format = {
+                                'border': 1,
+                                'font_name': '맑은 고딕',
+                                'font_size': 10
+                            }
                             
                             currency_format = workbook.add_format({
+                                **base_format,
                                 'num_format': '₩#,##0',
-                                'align': 'right',
-                                'border': 1
+                                'align': 'right'
                             })
-                            
+
+                            number_format = workbook.add_format({
+                                **base_format,
+                                'num_format': '#,##0',
+                                'align': 'right'
+                            })
+
                             percent_format = workbook.add_format({
+                                **base_format,
                                 'num_format': '0.00%',
-                                'align': 'right',
-                                'border': 1
+                                'align': 'right'
+                            })
+
+                            decimal_format = workbook.add_format({
+                                **base_format,
+                                'num_format': '0.0',
+                                'align': 'right'
+                            })
+
+                            date_format = workbook.add_format({
+                                **base_format,
+                                'align': 'center',
+                                'num_format': 'yyyy-mm-dd'
                             })
                             
                             text_format = workbook.add_format({
-                                'align': 'left',
-                                'border': 1
-                            })
-                            
-                            date_format = workbook.add_format({
-                                'num_format': 'yyyy-mm-dd',
-                                'align': 'center',
-                                'border': 1
+                                **base_format,
+                                'align': 'left'
                             })
 
                             # 1. 개요 시트 생성
@@ -535,7 +868,7 @@ if uploaded_file:
                             info_data = [
                                 ['분석 기간', f"{start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}"],
                                 ['기간 단위', date_option],
-                                ['캠페인 수', len(campaign_df)],
+                                ['캠페인 수', len(campaign_metrics)],
                                 ['선택된 카테고리', ', '.join(category_options)],
                                 ['선택된 매체', ', '.join(media_options)]
                             ]
@@ -552,10 +885,10 @@ if uploaded_file:
                                 ['총 노출수', total_impressions, number_format],
                                 ['총 클릭수', total_clicks, number_format],
                                 ['총 전환수', total_conversions, number_format],
-                                ['평균 CPC', safe_division(total_cost, total_clicks), currency_format],
-                                ['평균 CVR', safe_division(total_conversions, total_clicks), percent_format],
-                                ['평균 CTR', safe_division(total_clicks, total_impressions), percent_format]
+                                ['평균 ARPPU', avg_arppu, currency_format],
+                                ['평균 노출순위', avg_rank, decimal_format]
                             ]
+                            
                             for i, (label, value, fmt) in enumerate(metrics_data):
                                 summary_sheet.write(i+10, 0, label, text_format)
                                 summary_sheet.write(i+10, 1, value, fmt)
@@ -564,271 +897,141 @@ if uploaded_file:
                             summary_sheet.set_column('A:A', 20)
                             summary_sheet.set_column('B:B', 30)
                             
-                            # 2. 기간별 성과 시트
-                            period_sheet = workbook.add_worksheet('기간별_성과')
-                            period_sheet.merge_range('A1:K1', f'{date_option} 마케팅 성과 상세', title_format)
+                            # 필터 정보를 별도의 시트에 저장
+                            filter_sheet = workbook.add_worksheet('필터 정보')
+                            filter_sheet.write('A1', '필터 옵션', title_format)
+                            filter_sheet.set_row(0, 30)
+                            filter_sheet.write('A2', '캠페인 카테고리', header_format)
+                            filter_sheet.write('A3', ', '.join(category_options), text_format)
+                            filter_sheet.write('B2', '지역', header_format)
+                            filter_sheet.write('B3', ', '.join(region_options), text_format)
+                            filter_sheet.write('C2', '캠페인유형', header_format)
+                            filter_sheet.write('C3', ', '.join(campaign_type_options), text_format)
+                            filter_sheet.write('D2', '캠페인', header_format)
+                            filter_sheet.write('D3', ', '.join(campaign_options), text_format)
+                            filter_sheet.write('E2', '매체', header_format)
+                            filter_sheet.write('E3', ', '.join(media_options), text_format)
                             
-                            # 헤더 작성
-                            headers = ['기간', '총비용', '전환매출액', 'ROAS', '노출수', '클릭수', 'CTR', '전환수', 'CVR', 'CPC', 'CPA']
-                            for col, header in enumerate(headers):
-                                period_sheet.write(2, col, header, header_format)
-                            
-                            # 데이터 작성
-                            for row, data in enumerate(group_df_excel.values):
-                                period_sheet.write(row+3, 0, data[0], text_format)  # 기간
-                                period_sheet.write(row+3, 1, data[1], currency_format)  # 총비용
-                                period_sheet.write(row+3, 2, data[4], currency_format)  # 전환매출액
-                                period_sheet.write(row+3, 3, data[10]/100, percent_format)  # ROAS
-                                period_sheet.write(row+3, 4, data[2], number_format)  # 노출수
-                                period_sheet.write(row+3, 5, data[3], number_format)  # 클릭수
-                                period_sheet.write(row+3, 6, data[7]/100, percent_format)  # CTR
-                                period_sheet.write(row+3, 7, data[4], number_format)  # 전환수
-                                period_sheet.write(row+3, 8, data[9]/100, percent_format)  # CVR
-                                period_sheet.write(row+3, 9, data[6], currency_format)  # CPC
-                                period_sheet.write(row+3, 10, data[8], currency_format)  # CPA
-                            
-                            # 3. 캠페인별 성과 시트
-                            campaign_sheet = workbook.add_worksheet('캠페인별_성과')
-                            campaign_sheet.merge_range('A1:K1', '캠페인별 성과 분석', title_format)
-                            
-                            # 캠페인 데이터 정렬
-                            campaign_df_sorted = campaign_df_excel.sort_values('총비용(VAT포함,원)', ascending=False)
-                            
-                            # 헤더 작성
-                            campaign_headers = ['캠페인명', '총비용', '전환매출액', 'ROAS', '운영비중', '노출수', '클릭수', 'CTR', '전환수', 'CVR', '비고']
-                            for col, header in enumerate(campaign_headers):
-                                campaign_sheet.write(2, col, header, header_format)
-                            
-                            # 데이터 작성
-                            for row, (_, data) in enumerate(campaign_df_sorted.iterrows()):
-                                campaign_sheet.write(row+3, 0, data['캠페인'], text_format)
-                                campaign_sheet.write(row+3, 1, data['총비용(VAT포함,원)'], currency_format)
-                                campaign_sheet.write(row+3, 2, data['전환매출액(원)'], currency_format)
-                                campaign_sheet.write(row+3, 3, data['ROAS%']/100, percent_format)
-                                campaign_sheet.write(row+3, 4, data['운영비중']/100, percent_format)
-                                campaign_sheet.write(row+3, 5, data['노출수'], number_format)
-                                campaign_sheet.write(row+3, 6, data['클릭수'], number_format)
-                                campaign_sheet.write(row+3, 7, data['CTR%']/100, percent_format)
-                                campaign_sheet.write(row+3, 8, data['전환수'], number_format)
-                                campaign_sheet.write(row+3, 9, data['CVR%']/100, percent_format)
-                            
-                            # 4. 카테고리별 성과 시트
-                            category_sheet = workbook.add_worksheet('카테고리별_성과')
-                            category_sheet.merge_range('A1:J1', '카테고리별 성과 분석', title_format)
-                            
-                            # 카테고리 데이터 정렬
-                            category_df_sorted = category_df_excel.sort_values('총비용(VAT포함,원)', ascending=False)
-                            
-                            # 헤더 작성
-                            category_headers = ['카테고리', '총비용', '전환매출액', 'ROAS', '운영비중', '노출수', '클릭수', 'CTR', '전환수', 'CVR']
-                            for col, header in enumerate(category_headers):
-                                category_sheet.write(2, col, header, header_format)
-                            
-                            # 데이터 작성
-                            for row, (_, data) in enumerate(category_df_sorted.iterrows()):
-                                category_sheet.write(row+3, 0, data['캠페인카테고리'], text_format)
-                                category_sheet.write(row+3, 1, data['총비용(VAT포함,원)'], currency_format)
-                                category_sheet.write(row+3, 2, data['전환매출액(원)'], currency_format)
-                                category_sheet.write(row+3, 3, data['ROAS%']/100, percent_format)
-                                category_sheet.write(row+3, 4, data['운영비중']/100, percent_format)
-                                category_sheet.write(row+3, 5, data['노출수'], number_format)
-                                category_sheet.write(row+3, 6, data['클릭수'], number_format)
-                                category_sheet.write(row+3, 7, data['CTR%']/100, percent_format)
-                                category_sheet.write(row+3, 8, data['전환수'], number_format)
-                                category_sheet.write(row+3, 9, data['CVR%']/100, percent_format)
-
-                            if '캠페인유형' in filtered_df.columns:
-                                # 5. 캠페인유형별 성과 시트
-                                type_sheet = workbook.add_worksheet('캠페인유형별_성과')
-                                type_sheet.merge_range('A1:J1', '캠페인유형별 성과 분석', title_format)
+                            # 나머지 시트들 생성
+                            def save_df_to_excel(df, sheet_name, title):
+                                # 데이터 전처리
+                                processed_df = df.copy()
                                 
-                                # 캠페인유형 데이터 정렬
-                                campaign_type_df_sorted = campaign_type_df.sort_values('총비용(VAT포함,원)', ascending=False)
+                                # ROAS나 ARPPU가 포함된 모든 컬럼 찾기
+                                roas_cols = [col for col in processed_df.columns if 'ROAS' in col]
+                                arppu_cols = [col for col in processed_df.columns if 'ARPPU' in col]
+                                money_cols = [col for col in processed_df.columns if any(keyword in col for keyword in ['총비용', '전환매출액', 'CPC', 'CPA'])]
+                                percent_cols = [col for col in processed_df.columns if any(keyword in col for keyword in ['CTR', 'CVR', '운영비중'])]
                                 
-                                # 헤더 작성
-                                type_headers = ['캠페인유형', '총비용', '전환매출액', 'ROAS', '운영비중', '노출수', '클릭수', 'CTR', '전환수', 'CVR']
-                                for col, header in enumerate(type_headers):
-                                    type_sheet.write(2, col, header, header_format)
+                                # 데이터 형식 변환
+                                for col in processed_df.columns:
+                                    if col in money_cols + arppu_cols:
+                                        processed_df[col] = pd.to_numeric(processed_df[col], errors='coerce').fillna(0).round(0)
+                                    elif col in ['노출수', '클릭수', '전환수', '키워드']:
+                                        processed_df[col] = pd.to_numeric(processed_df[col], errors='coerce').fillna(0).round(0)
+                                    elif col in roas_cols + percent_cols:
+                                        processed_df[col] = pd.to_numeric(processed_df[col], errors='coerce').fillna(0).round(2) / 100
+                                    elif col == '평균노출순위' or '순위' in col:
+                                        processed_df[col] = pd.to_numeric(processed_df[col], errors='coerce').fillna(0).round(1)
+                                    elif '일별' in col.lower() or col == '기간' or 'date' in col.lower():
+                                        processed_df[col] = pd.to_datetime(processed_df[col], errors='coerce')
+
+                                # 시트 생성
+                                processed_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=1)
+                                worksheet = writer.sheets[sheet_name]
                                 
-                                # 데이터 작성
-                                for row, (_, data) in enumerate(campaign_type_df_sorted.iterrows()):
-                                    type_sheet.write(row+3, 0, data['캠페인유형'], text_format)
-                                    type_sheet.write(row+3, 1, data['총비용(VAT포함,원)'], currency_format)
-                                    type_sheet.write(row+3, 2, data['전환매출액(원)'], currency_format)
-                                    type_sheet.write(row+3, 3, data['ROAS%']/100, percent_format)
-                                    type_sheet.write(row+3, 4, data['운영비중'], percent_format)
-                                    type_sheet.write(row+3, 5, data['노출수'], number_format)
-                                    type_sheet.write(row+3, 6, data['클릭수'], number_format)
-                                    type_sheet.write(row+3, 7, data['CTR%']/100, percent_format)
-                                    type_sheet.write(row+3, 8, data['전환수'], number_format)
-                                    type_sheet.write(row+3, 9, data['CVR%']/100, percent_format)
+                                # 제목 추가
+                                worksheet.merge_range(0, 0, 0, len(processed_df.columns)-1, title, title_format)
+                                
+                                # 컬럼별 포맷 적용
+                                for col_num, col_name in enumerate(processed_df.columns):
+                                    # 헤더 포맷
+                                    worksheet.write(1, col_num, col_name, header_format)
+                                    
+                                    # 데이터 포맷
+                                    if col_name in money_cols + arppu_cols:
+                                        worksheet.set_column(col_num, col_num, 15, currency_format)
+                                    elif col_name in ['노출수', '클릭수', '전환수', '키워드']:
+                                        worksheet.set_column(col_num, col_num, 12, number_format)
+                                    elif col_name in roas_cols + percent_cols:
+                                        worksheet.set_column(col_num, col_num, 12, percent_format)
+                                    elif col_name == '평균노출순위' or '순위' in col_name:
+                                        worksheet.set_column(col_num, col_num, 12, decimal_format)
+                                    elif '일별' in col_name.lower() or col_name == '기간' or 'date' in col_name.lower():
+                                        worksheet.set_column(col_num, col_num, 12, date_format)
+                                    else:
+                                        worksheet.set_column(col_num, col_num, 15, text_format)
+                            
+                                # 필터 추가
+                                worksheet.autofilter(1, 0, len(processed_df)+1, len(processed_df.columns)-1)
+                                
+                                # 창 틀 고정
+                                worksheet.freeze_panes(2, 0)
 
-                            # 6. 매체별 성과 시트
-                            media_df = filtered_df.groupby('PC/모바일 매체').agg({
-                                '총비용(VAT포함,원)': 'sum',
-                                '전환매출액(원)': 'sum',
-                                '노출수': 'sum',
-                                '클릭수': 'sum',
-                                '전환수': 'sum'
-                            }).reset_index()
+                            # 각 시트 생성
+                            save_df_to_excel(group_df, '기간별_성과', f'{date_option} 마케팅 성과')
+                            save_df_to_excel(campaign_type_metrics, '캠페인유형별_성과', '캠페인유형별 성과')
+                            save_df_to_excel(region_metrics, '지역별_성과', '지역별 성과')
+                            save_df_to_excel(media_metrics, '매체별_성과', '매체별 성과')
+                            save_df_to_excel(campaign_metrics_sorted, '캠페인별_성과', '캠페인별 성과')
+                            save_df_to_excel(weekly_by_product, '상품유형별_주간성과', '상품유형별 주간 성과')
+                            save_df_to_excel(daily_by_product, '상품유형별_일별성과', '상품유형별 일별 성과')
                             
-                            media_df['ROAS%'] = safe_division(media_df['전환매출액(원)'], media_df['총비용(VAT포함,원)']) * 100
-                            media_df['CTR%'] = safe_division(media_df['클릭수'], media_df['노출수']) * 100
-                            media_df['CVR%'] = safe_division(media_df['전환수'], media_df['클릭수']) * 100
-                            media_df['운영비중'] = safe_division(media_df['총비용(VAT포함,원)'], media_df['총비용(VAT포함,원)'].sum()) * 100
+                            if len(promo_metrics) >= 2:
+                                save_df_to_excel(promo_metrics, '프로모션_성과비교', '프로모션 성과 비교')
                             
-                            media_sheet = workbook.add_worksheet('매체별_성과')
-                            media_sheet.merge_range('A1:J1', '매체별 성과 분석', title_format)
-                            
-                            # 헤더 작성
-                            media_headers = ['매체', '총비용', '전환매출액', 'ROAS', '운영비중', '노출수', '클릭수', 'CTR', '전환수', 'CVR']
-                            for col, header in enumerate(media_headers):
-                                media_sheet.write(2, col, header, header_format)
-                            
-                            # 데이터 작성
-                            for row, (_, data) in enumerate(media_df.iterrows()):
-                                media_sheet.write(row+3, 0, data['PC/모바일 매체'], text_format)
-                                media_sheet.write(row+3, 1, data['총비용(VAT포함,원)'], currency_format)
-                                media_sheet.write(row+3, 2, data['전환매출액(원)'], currency_format)
-                                media_sheet.write(row+3, 3, data['ROAS%']/100, percent_format)
-                                media_sheet.write(row+3, 4, data['운영비중']/100, percent_format)
-                                media_sheet.write(row+3, 5, data['노출수'], number_format)
-                                media_sheet.write(row+3, 6, data['클릭수'], number_format)
-                                media_sheet.write(row+3, 7, data['CTR%']/100, percent_format)
-                                media_sheet.write(row+3, 8, data['전환수'], number_format)
-                                media_sheet.write(row+3, 9, data['CVR%']/100, percent_format)
+                            save_df_to_excel(filtered_df, '일자별_상세데이터', '일자별 상세 데이터')
 
-                            # 7. 일자별 상세 데이터 시트
-                            detail_sheet = workbook.add_worksheet('일자별_상세데이터')
-                            detail_sheet.merge_range('A1:M1', '일자별 상세 데이터', title_format)
-                            
-                            # 날짜별로 정렬
-                            filtered_df_sorted = filtered_df_excel.sort_values('일별')
-                            
-                            # 헤더 작성
-                            detail_headers = [
-                                '일자', '캠페인', '캠페인카테고리', 'PC/모바일 매체',
-                                '총비용', '전환매출액', 'ROAS', '노출수', '클릭수', 'CTR',
-                                '전환수', 'CVR', 'CPC'
-                            ]
-                            for col, header in enumerate(detail_headers):
-                                detail_sheet.write(2, col, header, header_format)
-                            
-                            # 데이터 작성
-                            for row, (_, data) in enumerate(filtered_df_sorted.iterrows()):
-                                detail_sheet.write(row+3, 0, data['일별'], date_format)
-                                detail_sheet.write(row+3, 1, data['캠페인'], text_format)
-                                detail_sheet.write(row+3, 2, data['캠페인카테고리'], text_format)
-                                detail_sheet.write(row+3, 3, data['PC/모바일 매체'], text_format)
-                                detail_sheet.write(row+3, 4, data['총비용(VAT포함,원)'], currency_format)
-                                detail_sheet.write(row+3, 5, data['전환매출액(원)'], currency_format)
-                                detail_sheet.write(row+3, 6, data['ROAS%']/100, percent_format)
-                                detail_sheet.write(row+3, 7, data['노출수'], number_format)
-                                detail_sheet.write(row+3, 8, data['클릭수'], number_format)
-                                detail_sheet.write(row+3, 9, data['CTR%']/100, percent_format)
-                                detail_sheet.write(row+3, 10, data['전환수'], number_format)
-                                detail_sheet.write(row+3, 11, data['CVR%']/100, percent_format)
-                                detail_sheet.write(row+3, 12, data['CPC'], currency_format)
-
-                            # 8. 주요 분석 인사이트 시트
-                            insight_sheet = workbook.add_worksheet('주요_인사이트')
-                            insight_sheet.merge_range('A1:D1', '주요 마케팅 성과 인사이트', title_format)
-                            
-                            # 성과 상위 캠페인
-                            insight_sheet.merge_range('A3:D3', '성과 우수 캠페인 (ROAS 기준)', subtitle_format)
-                            top_roas_campaigns = campaign_df.nlargest(5, 'ROAS%')
-                            
-                            insight_headers = ['캠페인명', 'ROAS', '총비용', '전환매출액']
-                            for col, header in enumerate(insight_headers):
-                                insight_sheet.write(4, col, header, header_format)
-                            
-                            for row, (_, data) in enumerate(top_roas_campaigns.iterrows()):
-                                insight_sheet.write(row+5, 0, data['캠페인'], text_format)
-                                insight_sheet.write(row+5, 1, data['ROAS%']/100, percent_format)
-                                insight_sheet.write(row+5, 2, data['총비용(VAT포함,원)'], currency_format)
-                                insight_sheet.write(row+5, 3, data['전환매출액(원)'], currency_format)
-                            
-                            # 성과 하위 캠페인
-                            insight_sheet.merge_range('A11:D11', '성과 개선 필요 캠페인 (ROAS 기준)', subtitle_format)
-                            bottom_roas_campaigns = campaign_df.nsmallest(5, 'ROAS%')
-                            
-                            for col, header in enumerate(insight_headers):
-                                insight_sheet.write(12, col, header, header_format)
-                            
-                            for row, (_, data) in enumerate(bottom_roas_campaigns.iterrows()):
-                                insight_sheet.write(row+13, 0, data['캠페인'], text_format)
-                                insight_sheet.write(row+13, 1, data['ROAS%']/100, percent_format)
-                                insight_sheet.write(row+13, 2, data['총비용(VAT포함,원)'], currency_format)
-                                insight_sheet.write(row+13, 3, data['전환매출액(원)'], currency_format)
-                            
-                            # 카테고리별 성과 분석
-                            insight_sheet.merge_range('A19:D19', '카테고리별 성과 분석', subtitle_format)
-                            category_analysis = category_df.sort_values('ROAS%', ascending=False)
-                            
-                            category_headers = ['카테고리', 'ROAS', '운영비중', '전환매출액']
-                            for col, header in enumerate(category_headers):
-                                insight_sheet.write(20, col, header, header_format)
-                            
-                            for row, (_, data) in enumerate(category_analysis.iterrows()):
-                                insight_sheet.write(row+21, 0, data['캠페인카테고리'], text_format)
-                                insight_sheet.write(row+21, 1, data['ROAS%']/100, percent_format)
-                                insight_sheet.write(row+21, 2, data['운영비중']/100, percent_format)
-                                insight_sheet.write(row+21, 3, data['전환매출액(원)'], currency_format)
-
-                            # 9. 기간별 트렌드 차트 (선택적)
+                            # 차트 시트 생성 (옵션)
                             if include_charts:
-                                chart_sheet = workbook.add_worksheet('성과_차트')
-                                chart_sheet.merge_range('A1:J1', '주요 지표 트렌드 차트', title_format)
+                                chart_sheet = workbook.add_worksheet('차트')
+                                chart_sheet.merge_range('A1:N1', '주요 지표 차트', title_format)
                                 
-                                # 비용/매출 트렌드 차트
-                                revenue_cost_chart = workbook.add_chart({'type': 'line'})
-                                revenue_cost_chart.add_series({
+                                # 비용/매출 차트
+                                chart1 = workbook.add_chart({'type': 'line'})
+                                chart1.add_series({
                                     'name': '총비용',
-                                    'categories': f'기간별_성과!A4:A{len(group_df_excel)+3}',
-                                    'values': f'기간별_성과!B4:B{len(group_df_excel)+3}',
+                                    'categories': f"='기간별_성과'!$A$3:$A${len(group_df)+2}",
+                                    'values': f"='기간별_성과'!$B$3:$B${len(group_df)+2}",
                                     'line': {'color': 'blue'}
                                 })
-                                revenue_cost_chart.add_series({
+                                chart1.add_series({
                                     'name': '전환매출액',
-                                    'categories': f'기간별_성과!A4:A{len(group_df_excel)+3}',
-                                    'values': f'기간별_성과!C4:C{len(group_df_excel)+3}',
+                                    'categories': f"='기간별_성과'!$A$3:$A${len(group_df)+2}",
+                                    'values': f"='기간별_성과'!$F$3:$F${len(group_df)+2}",
                                     'line': {'color': 'green'}
                                 })
-                                revenue_cost_chart.set_title({'name': '비용/매출 트렌드'})
-                                revenue_cost_chart.set_size({'width': 720, 'height': 400})
-                                chart_sheet.insert_chart('A3', revenue_cost_chart)
-                                
-                                # ROAS 트렌드 차트
-                                roas_chart = workbook.add_chart({'type': 'column'})
-                                roas_chart.add_series({
+                                chart1.set_title({'name': '비용/매출 추이'})
+                                chart1.set_x_axis({'name': date_option})
+                                chart1.set_y_axis({'name': '금액 (원)'})
+                                chart1.set_size({'width': 720, 'height': 480})
+                                chart_sheet.insert_chart('A3', chart1)
+
+                                # ROAS 차트
+                                chart2 = workbook.add_chart({'type': 'column'})
+                                chart2.add_series({
                                     'name': 'ROAS',
-                                    'categories': f'기간별_성과!A4:A{len(group_df_excel)+3}',
-                                    'values': f'기간별_성과!D4:D{len(group_df_excel)+3}',
+                                    'categories': f"='기간별_성과'!$A$3:$A${len(group_df)+2}",
+                                    'values': f"='기간별_성과'!$L$3:$L${len(group_df)+2}",
                                     'fill': {'color': 'orange'}
                                 })
-                                roas_chart.set_title({'name': 'ROAS 트렌드'})
-                                roas_chart.set_size({'width': 720, 'height': 400})
-                                chart_sheet.insert_chart('A25', roas_chart)
+                                chart2.set_title({'name': 'ROAS 추이'})
+                                chart2.set_x_axis({'name': date_option})
+                                chart2.set_y_axis({'name': 'ROAS (%)'})
+                                chart2.set_size({'width': 720, 'height': 480})
+                                chart_sheet.insert_chart('A25', chart2)
 
-                            # 모든 시트의 열 너비 자동 조정
+                            # 모든 시트 확대/축소 비율 설정
                             for worksheet in workbook.worksheets():
-                                worksheet.set_column('A:A', 25)  # 첫 번째 열
-                                worksheet.set_column('B:Z', 15)  # 나머지 열
-                                worksheet.set_zoom(85)  # 기본 확대/축소 비율 설정
-                            
-                            # 필터 추가
-                            for worksheet in workbook.worksheets():
-                                if worksheet.name not in ['개요', '성과_차트']:
-                                    worksheet.autofilter(2, 0, 2, worksheet.dim_colmax)
+                                worksheet.set_zoom(85)
 
-                        # 버퍼 위치 처음으로
                         buffer.seek(0)
-
+                        
                         # 다운로드 버튼
                         st.download_button(
-                            label="📥 상세 보고서 다운로드",
+                            label="📥 Excel 보고서 다운로드",
                             data=buffer,
-                            file_name=f"{report_name}.xlsx",
+                            file_name=f"{report_name}_{datetime.now().strftime('%Y%m%d')}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         )
 
@@ -838,13 +1041,17 @@ if uploaded_file:
                     st.error(f"보고서 생성 중 오류가 발생했습니다: {str(e)}")
                     st.write("오류 상세 정보:", e)
 
-
     except Exception as e:
         st.error(f"데이터 처리 중 오류가 발생했습니다: {str(e)}")
+        st.write("오류 상세 정보:", e)
         st.stop()
 
 else:
     st.info("👈 좌측 사이드바에서 Excel 파일을 업로드하세요 ('raw 시트'와 'index 시트'가 포함된 파일)")
 
-# 페이지 여백 추가
-st.markdown("<br><br>", unsafe_allow_html=True)
+# 푸터 추가
+st.markdown("""
+<div style='position: fixed; bottom: 0; width: 100%; background-color: #f0f2f6; padding: 10px; text-align: center;'>
+    © 2024 마케팅 대시보드. All rights reserved.
+</div>
+""", unsafe_allow_html=True)
