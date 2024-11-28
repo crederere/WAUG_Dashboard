@@ -64,7 +64,7 @@ def safe_division(x, y):
 def format_date_axis(fig, date_option):
     """날짜 축 포맷 설정 함수"""
     if date_option == '일별':
-        dtick = 'D7'
+        dtick = 'D1'
         tickformat = '%Y-%m-%d'
     elif date_option == '주간':
         dtick = 'D7'
@@ -78,7 +78,7 @@ def format_date_axis(fig, date_option):
         tickformat=tickformat,
         tickangle=45,
         tickmode='auto',
-        nticks=10
+        nticks=20
     )
     return fig
 
@@ -102,7 +102,8 @@ def calculate_metrics(df):
     metrics['ARPPU'] = safe_division(metrics['전환매출액(원)'], metrics['전환수'])
     
     if '운영비중' not in metrics.columns:
-        metrics['운영비중'] = safe_division(metrics['총비용(VAT포함,원)'], metrics['총비용(VAT포함,원)'].sum()) * 100
+        total_cost = metrics['총비용(VAT포함,원)'].sum()
+        metrics['운영비중'] = safe_division(metrics['총비용(VAT포함,원)'], total_cost) * 100
     
     # 소수점 자리수 조정
     metrics['평균노출순위'] = metrics['평균노출순위'].round(1)
@@ -251,6 +252,14 @@ if uploaded_file:
                 default=['전체']
             )
 
+            # 상품유형 필터 추가
+            unique_product_types = sorted(raw_df['상품유형'].dropna().astype(str).unique())
+            product_type_options = st.sidebar.multiselect(
+                '상품유형 선택',
+                options=['전체'] + unique_product_types,
+                default=['전체']
+            )
+
             # 전체 선택 처리
             if '전체' in category_options or len(category_options) == 0:
                 category_options = unique_categories
@@ -258,12 +267,15 @@ if uploaded_file:
                 region_options = unique_regions
             if '전체' in campaign_type_options or len(campaign_type_options) == 0:
                 campaign_type_options = unique_campaign_types
+            if '전체' in product_type_options or len(product_type_options) == 0:
+                product_type_options = unique_product_types
 
             # 캠페인 필터
             unique_campaigns = sorted(raw_df[
                 (raw_df['캠페인카테고리'].isin(category_options)) &
                 (raw_df['지역'].isin(region_options)) &
-                (raw_df['캠페인유형'].isin(campaign_type_options))
+                (raw_df['캠페인유형'].isin(campaign_type_options)) &
+                (raw_df['상품유형'].isin(product_type_options))
             ]['캠페인'].unique())
             
             campaign_options = st.sidebar.multiselect(
@@ -292,7 +304,8 @@ if uploaded_file:
                    (raw_df['캠페인'].isin(campaign_options)) & \
                    (raw_df['PC/모바일 매체'].isin(media_options)) & \
                    (raw_df['지역'].isin(region_options)) & \
-                   (raw_df['캠페인유형'].isin(campaign_type_options))
+                   (raw_df['캠페인유형'].isin(campaign_type_options)) & \
+                   (raw_df['상품유형'].isin(product_type_options))
 
             filtered_df = raw_df.loc[mask].copy()
 
@@ -302,6 +315,13 @@ if uploaded_file:
 
             # 지표 계산
             filtered_df = calculate_metrics(filtered_df)
+
+            # **'전체' 상품유형 데이터 추가**
+            total_df = filtered_df.copy()
+            total_df['상품유형'] = '전체'
+
+            # '전체' 데이터와 원본 데이터 결합
+            filtered_df = pd.concat([filtered_df, total_df], ignore_index=True)
 
             # 데이터 집계
             agg_dict = {
@@ -314,15 +334,15 @@ if uploaded_file:
                 '키워드': 'nunique'
             }
 
-            # 기간별 집계
+            # 기간별 집계 (상품유형 포함)
             if date_option == '일별':
-                group_df = filtered_df.groupby('일별').agg(agg_dict).reset_index()
+                group_df = filtered_df.groupby(['일별', '상품유형']).agg(agg_dict).reset_index()
                 group_df.rename(columns={'일별': '기간'}, inplace=True)
             elif date_option == '주간':
-                group_df = filtered_df.groupby('주차_기간').agg(agg_dict).reset_index()
+                group_df = filtered_df.groupby(['주차_기간', '상품유형']).agg(agg_dict).reset_index()
                 group_df.rename(columns={'주차_기간': '기간'}, inplace=True)
             else:  # 월별
-                group_df = filtered_df.groupby('월').agg(agg_dict).reset_index()
+                group_df = filtered_df.groupby(['월', '상품유형']).agg(agg_dict).reset_index()
                 group_df.rename(columns={'월': '기간'}, inplace=True)
 
             group_df = calculate_metrics(group_df)
@@ -334,14 +354,14 @@ if uploaded_file:
             st.header("📈 기간별 성과 지표")
 
             # 주요 지표 카드
-            total_cost = filtered_df['총비용(VAT포함,원)'].sum()
-            total_revenue = filtered_df['전환매출액(원)'].sum()
+            total_cost = filtered_df[filtered_df['상품유형'] == '전체']['총비용(VAT포함,원)'].sum()
+            total_revenue = filtered_df[filtered_df['상품유형'] == '전체']['전환매출액(원)'].sum()
             total_roas = safe_division(total_revenue, total_cost) * 100
-            total_clicks = filtered_df['클릭수'].sum()
-            total_impressions = filtered_df['노출수'].sum()
-            total_conversions = filtered_df['전환수'].sum()
+            total_clicks = filtered_df[filtered_df['상품유형'] == '전체']['클릭수'].sum()
+            total_impressions = filtered_df[filtered_df['상품유형'] == '전체']['노출수'].sum()
+            total_conversions = filtered_df[filtered_df['상품유형'] == '전체']['전환수'].sum()
             avg_arppu = safe_division(total_revenue, total_conversions)
-            avg_rank = filtered_df['평균노출순위'].mean()
+            avg_rank = filtered_df[filtered_df['상품유형'] == '전체']['평균노출순위'].mean()
             # 지표 카드 표시
             col1, col2, col3, col4, col5 = st.columns(5)
 
@@ -355,13 +375,16 @@ if uploaded_file:
             st.subheader(f"📊 {date_option} 차트")
 
             # 탭 생성
-            tab1, tab2, tab3, tab4 = st.tabs(["비용/매출", "ROAS/ARPPU", "노출순위", "프로모션 분석"])
+            tab1, tab2, tab3, tab4, tab5 = st.tabs(["비용/매출", "ROAS/ARPPU", "노출순위", "프로모션 분석", "국가별 매출 트렌드"])
+
+            # 기간별 전체 데이터 필터링
+            group_total_df = group_df[group_df['상품유형'] == '전체']
 
             # 비용/매출 차트
             with tab1:
                 fig1 = go.Figure()
 
-                df_to_plot = group_df
+                df_to_plot = group_total_df
                 x_col = '기간'
 
                 fig1.add_trace(go.Scatter(
@@ -399,6 +422,8 @@ if uploaded_file:
             # ROAS/ARPPU 차트
             with tab2:
                 fig2 = go.Figure()
+
+                df_to_plot = group_total_df
 
                 fig2.add_trace(go.Bar(
                     x=df_to_plot[x_col],
@@ -473,17 +498,18 @@ if uploaded_file:
 
             # 프로모션 분석
             with tab4:
-                promo_metrics = filtered_df.groupby('프로모션여부').agg(agg_dict).reset_index()
+                promo_metrics = filtered_df.groupby(['프로모션여부', '상품유형']).agg(agg_dict).reset_index()
                 promo_metrics = calculate_metrics(promo_metrics)
 
-                fig4 = None  # fig4 초기화
+                # '전체' 상품유형 데이터만 사용
+                promo_metrics_total = promo_metrics[promo_metrics['상품유형'] == '전체']
 
-                if len(promo_metrics) >= 2:  # 프로모션 전/후 데이터가 모두 있는 경우
+                if len(promo_metrics_total) >= 2:  # 프로모션 전/후 데이터가 모두 있는 경우
                     # 프로모션 성과 비교 차트
                     fig4 = go.Figure()
 
-                    promo_before = promo_metrics[promo_metrics['프로모션여부'] == 'N']
-                    promo_after = promo_metrics[promo_metrics['프로모션여부'] == 'Y']
+                    promo_before = promo_metrics_total[promo_metrics_total['프로모션여부'] == 'N']
+                    promo_after = promo_metrics_total[promo_metrics_total['프로모션여부'] == 'Y']
 
                     fig4.add_trace(go.Bar(
                         x=['프로모션 전', '프로모션 후'],
@@ -519,9 +545,64 @@ if uploaded_file:
                 else:
                     st.warning("프로모션 전/후 비교를 위한 충분한 데이터가 없습니다.")
 
+            # 국가별 일별 Revenue 트렌드
+            with tab5:
+                st.subheader("🌍 국가별 일별 매출 트렌드")
+                if '지역' in filtered_df.columns:
+                    country_daily_revenue = filtered_df[filtered_df['상품유형'] == '전체'].groupby(['일별', '지역']).agg({
+                        '전환매출액(원)': 'sum'
+                    }).reset_index()
+
+                    # 국가 선택 옵션 추가
+                    unique_countries = country_daily_revenue['지역'].unique()
+                    total_revenue_by_country = country_daily_revenue.groupby('지역')['전환매출액(원)'].sum().reset_index()
+                    total_revenue_by_country = total_revenue_by_country.sort_values('전환매출액(원)', ascending=False)
+                    top_10_countries = total_revenue_by_country['지역'].head(10).tolist()
+
+                    country_selection = st.multiselect(
+                        '국가 선택',
+                        options=['상위 10개 보기', '전체 보기'] + list(unique_countries),
+                        default=['상위 10개 보기']
+                    )
+
+                    if '상위 10개 보기' in country_selection:
+                        selected_countries = top_10_countries
+                    elif '전체 보기' in country_selection or len(country_selection) == 0:
+                        selected_countries = unique_countries
+                    else:
+                        selected_countries = country_selection
+
+                    filtered_country_data = country_daily_revenue[country_daily_revenue['지역'].isin(selected_countries)]
+
+                    # 금액을 원화로 표시하고 소수점 제거
+                    filtered_country_data['전환매출액(원)'] = filtered_country_data['전환매출액(원)'].round(0)
+
+                    fig5 = px.line(
+                        filtered_country_data,
+                        x='일별',
+                        y='전환매출액(원)',
+                        color='지역',
+                        title='국가별 일별 매출 트렌드',
+                        labels={'일별': '일자', '전환매출액(원)': '매출액 (원)', '지역': '국가'}
+                    )
+
+                    fig5.update_layout(
+                        xaxis_title='일자',
+                        yaxis_title='매출액 (원)',
+                        hovermode='x unified',
+                        height=600
+                    )
+
+                    fig5.update_xaxes(tickformat='%Y-%m-%d', tickangle=45)
+                    fig5.update_yaxes(tickformat=',')  # 천단위 콤마 표시
+
+                    st.plotly_chart(fig5, use_container_width=True)
+                else:
+                    st.warning("데이터에 '지역' 컬럼이 없습니다.")
+
             # 기간별 데이터 표 생성
-            st.subheader(f"📅 {date_option}별 데이터 표")
-            styled_group_df = style_dataframe(group_df)
+            st.subheader(f"📅 {date_option} 데이터 표")
+            styled_group_df = style_dataframe(group_total_df)
             st.dataframe(styled_group_df, height=400)
 
             # 5. 세부 분석
@@ -531,19 +612,9 @@ if uploaded_file:
             st.subheader("📅 일별 분석")
 
             # 일별 데이터 준비 및 지표 계산
-            daily_by_product = filtered_df.groupby(['일별', '상품유형']).agg({
-                '총비용(VAT포함,원)': 'sum',
-                '노출수': 'sum',
-                '클릭수': 'sum',
-                '전환수': 'sum',
-                '전환매출액(원)': 'sum',
-                '평균노출순위': 'mean'
-            }).reset_index()
+            daily_by_product = filtered_df.groupby(['일별', '상품유형']).agg(agg_dict).reset_index()
 
             daily_by_product = calculate_metrics(daily_by_product)
-
-            # 여기서 캠페인을 컬럼으로 pivot하지 않고, 행으로 유지하도록 수정
-            # 대신 필요한 컬럼 순서로 정렬하고, 보기 좋게 정렬
 
             # 컬럼 순서 재정렬
             daily_by_product = daily_by_product[['일별', '상품유형', '총비용(VAT포함,원)', '전환매출액(원)', 'ROAS', 'ARPPU', '전환수', '평균노출순위']]
@@ -574,7 +645,7 @@ if uploaded_file:
                 hovermode='x unified',
                 height=600
             )
-            fig_daily.update_xaxes(tickangle=45)
+            fig_daily.update_xaxes(tickformat='%Y-%m-%d', tickangle=45)
 
             st.plotly_chart(fig_daily, use_container_width=True)
 
@@ -582,14 +653,7 @@ if uploaded_file:
             st.subheader("📅 상품유형별 주간 분석")
             
             # 주간 데이터 준비 및 지표 계산
-            weekly_by_product = filtered_df.groupby(['주차', '주차_기간', '상품유형']).agg({
-                '총비용(VAT포함,원)': 'sum',
-                '노출수': 'sum',
-                '클릭수': 'sum',
-                '전환수': 'sum',
-                '전환매출액(원)': 'sum',
-                '평균노출순위': 'mean'
-            }).reset_index()
+            weekly_by_product = filtered_df.groupby(['주차', '주차_기간', '상품유형']).agg(agg_dict).reset_index()
 
             weekly_by_product = calculate_metrics(weekly_by_product)
 
@@ -629,49 +693,19 @@ if uploaded_file:
             # 캠페인유형별 분석
             st.subheader("🎯 캠페인유형별 분석")
             
-            campaign_type_metrics = filtered_df.groupby('캠페인유형').agg(agg_dict).reset_index()
+            # 매체별 및 상품유형 추가
+            campaign_type_metrics = filtered_df.groupby(['캠페인유형', 'PC/모바일 매체', '상품유형']).agg(agg_dict).reset_index()
             campaign_type_metrics = calculate_metrics(campaign_type_metrics)
             campaign_type_metrics = campaign_type_metrics.drop_duplicates()
             
-            # 캠페인유형별 차트
-            fig_type = make_subplots(specs=[[{"secondary_y": True}]])
-            
-            fig_type.add_trace(go.Bar(
-                x=campaign_type_metrics['캠페인유형'],
-                y=campaign_type_metrics['총비용(VAT포함,원)'],
-                name='총비용',
-                marker_color='#1f77b4',
-                text=campaign_type_metrics['총비용(VAT포함,원)'].apply(lambda x: f'₩{x:,.0f}'),
-                textposition='outside'
-            ), secondary_y=False)
-
-            fig_type.add_trace(go.Scatter(
-                x=campaign_type_metrics['캠페인유형'],
-                y=campaign_type_metrics['ROAS'],
-                name='ROAS',
-                yaxis='y2',
-                line=dict(color='#2ca02c'),
-                text=campaign_type_metrics['ROAS'].round(2).astype(str) + '%',
-                mode='lines+markers+text',
-                textposition='bottom center'
-            ), secondary_y=True)
-
-            fig_type.update_layout(
-                title='캠페인유형별 비용 및 ROAS',
-                yaxis_title='총비용 (원)',
-                yaxis2=dict(
-                    title='ROAS (%)',
-                    overlaying='y',
-                    side='right'
-                ),
-                showlegend=True,
-                height=600
-            )
-
-            st.plotly_chart(fig_type, use_container_width=True)
-            
             # 캠페인유형별 성과표
-            st.dataframe(style_dataframe(campaign_type_metrics))
+            st.subheader("📊 캠페인유형별 성과")
+            selected_campaign_type = st.selectbox('캠페인유형 선택', ['전체'] + list(campaign_type_metrics['캠페인유형'].unique()))
+            if selected_campaign_type == '전체':
+                campaign_type_filtered = campaign_type_metrics.copy()
+            else:
+                campaign_type_filtered = campaign_type_metrics[campaign_type_metrics['캠페인유형'] == selected_campaign_type]
+            st.dataframe(style_dataframe(campaign_type_filtered))
 
             # 지역별 분석
             st.subheader("🌏 지역별 분석")
@@ -681,9 +715,13 @@ if uploaded_file:
             region_metrics = region_metrics.sort_values('총비용(VAT포함,원)', ascending=False)
             region_metrics = region_metrics.drop_duplicates()
             
-            # 상위 10개 지역만 표시
-            top_regions = region_metrics['지역'].head(10).tolist()
-            region_metrics_top = region_metrics[region_metrics['지역'].isin(top_regions)]
+            # 상위 10개 지역만 표시 옵션 추가
+            region_display_option = st.selectbox('지역 표시 옵션', ['상위 10개 보기', '전체 보기'])
+            if region_display_option == '상위 10개 보기':
+                top_regions = region_metrics['지역'].head(10).tolist()
+                region_metrics_top = region_metrics[region_metrics['지역'].isin(top_regions)]
+            else:
+                region_metrics_top = region_metrics.copy()
             
             # 지역별 ROAS 차트
             fig_region = px.bar(
@@ -691,7 +729,8 @@ if uploaded_file:
                 x='지역',
                 y='ROAS',
                 title='지역별 ROAS',
-                text=region_metrics_top['ROAS'].round(2).astype(str) + '%'
+                text=region_metrics_top['ROAS'].round(2).astype(str) + '%',
+                labels={'지역': '지역', 'ROAS': 'ROAS (%)'}
             )
             fig_region.update_traces(textposition='outside')
             fig_region.update_layout(
@@ -704,7 +743,7 @@ if uploaded_file:
             st.plotly_chart(fig_region, use_container_width=True)
             
             # 지역별 성과표
-            st.dataframe(style_dataframe(region_metrics))
+            st.dataframe(style_dataframe(region_metrics_top))
 
             # 매체별 분석
             st.subheader("📱 매체별 분석")
@@ -870,14 +909,15 @@ if uploaded_file:
                                 ['기간 단위', date_option],
                                 ['캠페인 수', len(campaign_metrics)],
                                 ['선택된 카테고리', ', '.join(category_options)],
-                                ['선택된 매체', ', '.join(media_options)]
+                                ['선택된 매체', ', '.join(media_options)],
+                                ['선택된 상품유형', ', '.join(product_type_options)]
                             ]
                             for i, (label, value) in enumerate(info_data):
                                 summary_sheet.write(i+3, 0, label, text_format)
                                 summary_sheet.write(i+3, 1, value, text_format)
                             
                             # 주요 지표 요약
-                            summary_sheet.merge_range('A9:B9', '주요 성과 지표', subtitle_format)
+                            summary_sheet.merge_range('A10:B10', '주요 성과 지표', subtitle_format)
                             metrics_data = [
                                 ['총 비용', total_cost, currency_format],
                                 ['총 매출', total_revenue, currency_format],
@@ -890,8 +930,8 @@ if uploaded_file:
                             ]
                             
                             for i, (label, value, fmt) in enumerate(metrics_data):
-                                summary_sheet.write(i+10, 0, label, text_format)
-                                summary_sheet.write(i+10, 1, value, fmt)
+                                summary_sheet.write(i+11, 0, label, text_format)
+                                summary_sheet.write(i+11, 1, value, fmt)
                             
                             # 열 너비 조정
                             summary_sheet.set_column('A:A', 20)
@@ -907,13 +947,44 @@ if uploaded_file:
                             filter_sheet.write('B3', ', '.join(region_options), text_format)
                             filter_sheet.write('C2', '캠페인유형', header_format)
                             filter_sheet.write('C3', ', '.join(campaign_type_options), text_format)
-                            filter_sheet.write('D2', '캠페인', header_format)
-                            filter_sheet.write('D3', ', '.join(campaign_options), text_format)
-                            filter_sheet.write('E2', '매체', header_format)
-                            filter_sheet.write('E3', ', '.join(media_options), text_format)
+                            filter_sheet.write('D2', '상품유형', header_format)
+                            filter_sheet.write('D3', ', '.join(product_type_options), text_format)
+                            filter_sheet.write('E2', '캠페인', header_format)
+                            filter_sheet.write('E3', ', '.join(campaign_options), text_format)
+                            filter_sheet.write('F2', '매체', header_format)
+                            filter_sheet.write('F3', ', '.join(media_options), text_format)
                             
                             # 나머지 시트들 생성
-                            def save_df_to_excel(df, sheet_name, title):
+                            # 각 데이터프레임을 저장하기 위해 딕셔너리에 저장
+                            dfs_to_save = {}
+
+                            # Excel 보고서에서는 '상품유형' 필터에 모든 상품유형이 나타나도록 하기 위해, '전체'를 포함한 데이터를 사용합니다.
+
+                          # 기간별 성과 데이터 생성
+                            raw_group_df = filtered_df.copy()
+
+                            # '기간' 컬럼 생성
+                            if date_option == '일별':
+                                raw_group_df['기간'] = raw_group_df['일별']
+                            elif date_option == '주간':
+                                raw_group_df['기간'] = raw_group_df['주차_기간']
+                            else:  # 월별
+                                raw_group_df['기간'] = raw_group_df['월']
+
+                            # 그룹화 및 지표 계산
+                            raw_group_df = raw_group_df.groupby(['기간', '상품유형']).agg(agg_dict).reset_index()
+                            raw_group_df = calculate_metrics(raw_group_df)
+                            raw_group_df = raw_group_df.drop_duplicates()
+
+                            # 캠페인유형별 성과 데이터 생성
+                            raw_campaign_type_metrics = filtered_df.groupby(['캠페인유형', 'PC/모바일 매체', '상품유형']).agg(agg_dict).reset_index()
+                            raw_campaign_type_metrics = calculate_metrics(raw_campaign_type_metrics)
+                            raw_campaign_type_metrics = raw_campaign_type_metrics.drop_duplicates()
+
+                            # 나머지 데이터는 필터링된 데이터를 사용합니다.
+
+                            # 데이터 저장 함수
+                            def save_df_to_excel(df, sheet_name, title, add_filter=False):
                                 # 데이터 전처리
                                 processed_df = df.copy()
                                 
@@ -961,26 +1032,40 @@ if uploaded_file:
                                         worksheet.set_column(col_num, col_num, 12, date_format)
                                     else:
                                         worksheet.set_column(col_num, col_num, 15, text_format)
-                            
-                                # 필터 추가
-                                worksheet.autofilter(1, 0, len(processed_df)+1, len(processed_df.columns)-1)
+                                
+                                # 필터 추가 여부
+                                if add_filter:
+                                    worksheet.autofilter(1, 0, len(processed_df)+1, len(processed_df.columns)-1)
                                 
                                 # 창 틀 고정
                                 worksheet.freeze_panes(2, 0)
 
+                                # 데이터프레임 저장
+                                dfs_to_save[sheet_name] = processed_df
+
                             # 각 시트 생성
-                            save_df_to_excel(group_df, '기간별_성과', f'{date_option} 마케팅 성과')
-                            save_df_to_excel(campaign_type_metrics, '캠페인유형별_성과', '캠페인유형별 성과')
-                            save_df_to_excel(region_metrics, '지역별_성과', '지역별 성과')
-                            save_df_to_excel(media_metrics, '매체별_성과', '매체별 성과')
-                            save_df_to_excel(campaign_metrics_sorted, '캠페인별_성과', '캠페인별 성과')
-                            save_df_to_excel(weekly_by_product, '상품유형별_주간성과', '상품유형별 주간 성과')
-                            save_df_to_excel(daily_by_product, '상품유형별_일별성과', '상품유형별 일별 성과')
+                            save_df_to_excel(raw_group_df, '기간별_성과', f'{date_option} 마케팅 성과', add_filter=True)
+                            save_df_to_excel(raw_campaign_type_metrics, '캠페인유형별_성과', '캠페인유형별 성과', add_filter=True)
+                            save_df_to_excel(region_metrics, '지역별_성과', '지역별 성과', add_filter=True)
+                            save_df_to_excel(media_metrics, '매체별_성과', '매체별 성과', add_filter=True)
+                            save_df_to_excel(campaign_metrics_sorted, '캠페인별_성과', '캠페인별 성과', add_filter=True)
+                            save_df_to_excel(weekly_by_product, '상품유형별_주간성과', '상품유형별 주간 성과', add_filter=True)
+                            save_df_to_excel(daily_by_product, '상품유형별_일별성과', '상품유형별 일별 성과', add_filter=True)
                             
                             if len(promo_metrics) >= 2:
-                                save_df_to_excel(promo_metrics, '프로모션_성과비교', '프로모션 성과 비교')
+                                save_df_to_excel(promo_metrics, '프로모션_성과비교', '프로모션 성과 비교', add_filter=True)
                             
-                            save_df_to_excel(filtered_df, '일자별_상세데이터', '일자별 상세 데이터')
+                            save_df_to_excel(filtered_df, '일자별_상세데이터', '일자별 상세 데이터', add_filter=True)
+
+                            # 모든 시트에 '상품유형' 필터 추가
+                            for sheet_name in ['기간별_성과', '캠페인유형별_성과']:
+                                worksheet = writer.sheets[sheet_name]
+                                df = dfs_to_save[sheet_name]
+                                if '상품유형' in df.columns:
+                                    product_type_col = df.columns.get_loc('상품유형')
+                                    # 필터는 이미 추가되었으므로, 사용자가 엑셀에서 필터링할 수 있습니다.
+                                else:
+                                    pass
 
                             # 차트 시트 생성 (옵션)
                             if include_charts:
@@ -991,14 +1076,14 @@ if uploaded_file:
                                 chart1 = workbook.add_chart({'type': 'line'})
                                 chart1.add_series({
                                     'name': '총비용',
-                                    'categories': f"='기간별_성과'!$A$3:$A${len(group_df)+2}",
-                                    'values': f"='기간별_성과'!$B$3:$B${len(group_df)+2}",
+                                    'categories': f"='기간별_성과'!$A$3:$A${len(raw_group_df)+2}",
+                                    'values': f"='기간별_성과'!$C$3:$C${len(raw_group_df)+2}",
                                     'line': {'color': 'blue'}
                                 })
                                 chart1.add_series({
                                     'name': '전환매출액',
-                                    'categories': f"='기간별_성과'!$A$3:$A${len(group_df)+2}",
-                                    'values': f"='기간별_성과'!$F$3:$F${len(group_df)+2}",
+                                    'categories': f"='기간별_성과'!$A$3:$A${len(raw_group_df)+2}",
+                                    'values': f"='기간별_성과'!$G$3:$G${len(raw_group_df)+2}",
                                     'line': {'color': 'green'}
                                 })
                                 chart1.set_title({'name': '비용/매출 추이'})
@@ -1011,8 +1096,8 @@ if uploaded_file:
                                 chart2 = workbook.add_chart({'type': 'column'})
                                 chart2.add_series({
                                     'name': 'ROAS',
-                                    'categories': f"='기간별_성과'!$A$3:$A${len(group_df)+2}",
-                                    'values': f"='기간별_성과'!$L$3:$L${len(group_df)+2}",
+                                    'categories': f"='기간별_성과'!$A$3:$A${len(raw_group_df)+2}",
+                                    'values': f"='기간별_성과'!$M$3:$M${len(raw_group_df)+2}",
                                     'fill': {'color': 'orange'}
                                 })
                                 chart2.set_title({'name': 'ROAS 추이'})
